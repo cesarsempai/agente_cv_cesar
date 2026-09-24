@@ -3,7 +3,7 @@ import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from openai import OpenAI, OpenAIError
 
 
@@ -59,12 +59,8 @@ def obtener_mensajes(entrada):
     return mensajes
 
 
-def responder_con_ia(mensajes):
-    """Responde usando el CV y los mensajes recibidos en esta petición.
-
-    No guarda conversaciones en el servidor. Para dar seguimiento a una
-    conversación, el cliente debe enviar también los mensajes anteriores.
-    """
+def responder_con_ia(mensajes, stream=False):
+    """Consulta el modelo con el CV y los mensajes de esta petición."""
     respuesta = OpenAI().responses.create(
         model="gpt-4.1-mini",
         instructions=(
@@ -80,8 +76,27 @@ def responder_con_ia(mensajes):
         input=mensajes,
         max_output_tokens=350,
         store=False,
+        stream=stream,
     )
+
+    if stream:
+        return respuesta
+
     return respuesta.output_text
+
+
+def transmitir_eventos(eventos):
+    """Envía al cliente los eventos de la respuesta por partes."""
+    try:
+        for evento in eventos:
+            yield (
+                f"event: {evento.type}\n"
+                f"data: {evento.model_dump_json(exclude_none=True)}\n\n"
+            )
+
+        yield "data: [DONE]\n\n"
+    finally:
+        eventos.close()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -99,17 +114,26 @@ def health():
 
 @app.post("/v1/responses")
 def crear_respuesta(datos: dict):
-    if datos.get("stream") is True:
-        raise HTTPException(
-            status_code=501,
-            detail="Este endpoint todavía no admite respuestas en streaming."
-        )
-
     mensajes = obtener_mensajes(datos.get("input", ""))
     if not mensajes or mensajes[-1]["role"] != "user":
         raise HTTPException(
             status_code=400,
             detail="Envía una pregunta en input como texto o como último mensaje de usuario."
+        )
+
+    if datos.get("stream") is True:
+        try:
+            eventos = responder_con_ia(mensajes, stream=True)
+        except OpenAIError:
+            raise HTTPException(
+                status_code=502,
+                detail="No se pudo consultar el modelo de lenguaje."
+            )
+
+        return StreamingResponse(
+            transmitir_eventos(eventos),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache"},
         )
 
     try:
